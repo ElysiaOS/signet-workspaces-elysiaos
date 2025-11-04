@@ -1,5 +1,6 @@
 CXX = g++
-CXXFLAGS = -std=c++17 -Wall -Wextra
+CXXFLAGS = -std=c++17 -Wall -Wextra -march=x86-64-v2 -mtune=generic
+LDFLAGS=-Wl,-z,x86-64-v2 -Wl,--no-as-needed
 TARGET = ely-workspace-switcher
 SOURCE = workspace-switcher.cpp
 
@@ -12,7 +13,8 @@ LDFLAGS = $(shell pkg-config --libs $(PKG_CONFIG_PACKAGES))
 
 # Build target
 $(TARGET): $(SOURCE)
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCE) $(LDFLAGS)
+	$(CXX) $(LDFLAGS) $(CXXFLAGS) -o $(TARGET) $(SOURCE)
+	@objcopy --remove-section=.note.gnu.property $@
 
 # Clean target
 clean:

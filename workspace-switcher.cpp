@@ -16,6 +16,7 @@
 #include <future>
 #include <unordered_map>
 #include <mutex>
+#include <fstream>
 
 class WorkspaceSwitcher {
 private:
@@ -48,6 +49,7 @@ private:
     int icon_size;
     int app_icon_size;
     int special_button_size; // Size for workspace 13
+    std::string workspace_icon_path; // Theme-specific workspace icon path
 
     // Static callbacks
     static gboolean on_button_enter_static(GtkWidget* button, GdkEventCrossing* event, gpointer user_data);
@@ -78,10 +80,53 @@ private:
         // --- END CHANGE ---
     }
 
+    std::string determine_workspace_icon_path() {
+        std::string home_dir = getenv("HOME") ? getenv("HOME") : "";
+        std::string light_txt_path = home_dir + "/.config/hypr/Light.txt";
+        
+        // Default to Theme 1 (current/ely theme)
+        std::string default_path = home_dir + "/.config/Elysia/assets/workspace/";
+        
+        // Check if Light.txt exists
+        if (!std::filesystem::exists(light_txt_path)) {
+            return default_path;
+        }
+        
+        // Read the file content
+        std::ifstream file(light_txt_path);
+        if (!file.is_open()) {
+            return default_path;
+        }
+        
+        std::string content;
+        std::string line;
+        while (std::getline(file, line)) {
+            content += line;
+        }
+        file.close();
+        
+        // Check for "cyrene" theme
+        if (content.find("cyrene") != std::string::npos) {
+            // Theme 2: cyrene
+            return home_dir + "/.config/Elysia/assets/workspace/AMPH/";
+        }
+        
+        // Check for "ely" theme or default to Theme 1
+        if (content.find("ely") != std::string::npos) {
+            // Theme 1: ely (current theme)
+            return default_path;
+        }
+        
+        // If file exists but doesn't contain either keyword, default to Theme 1
+        return default_path;
+    }
+
 public:
     WorkspaceSwitcher() {
         // Minimal startup - just show the window ASAP
         calculate_dimensions();
+        // Determine workspace icon path based on theme
+        workspace_icon_path = determine_workspace_icon_path();
         create_window();
         setup_layer_shell();
         // Create buttons immediately but without icons (fastest)
@@ -151,8 +196,7 @@ public:
     }
 
     void load_workspace_icon(int workspace_id) {
-        std::string home_dir = getenv("HOME") ? getenv("HOME") : "";
-        std::string image_path = home_dir + "/.config/Elysia/assets/workspace/" + std::to_string(workspace_id) + ".png";
+        std::string image_path = workspace_icon_path + std::to_string(workspace_id) + ".png";
         if (!std::filesystem::exists(image_path)) {
             return; // Skip if file doesn't exist
         }
@@ -510,13 +554,23 @@ public:
         
         // Load tooltip data on-demand for better performance
         std::vector<std::string> apps = get_workspace_apps(workspace_id);
-        std::string screenshot_path = get_screenshot_path(workspace_id);
-        GdkPixbuf* thumbnail = create_workspace_thumbnail_from_path(screenshot_path);
-        if (thumbnail) {
-            gtk_image_set_from_pixbuf(GTK_IMAGE(tooltip_image), thumbnail);
-            gtk_widget_show(tooltip_image);
-            g_object_unref(thumbnail);
+        
+        // Only show thumbnail image if workspace has apps
+        if (!apps.empty()) {
+            std::string screenshot_path = get_screenshot_path(workspace_id);
+            GdkPixbuf* thumbnail = create_workspace_thumbnail_from_path(screenshot_path);
+            if (thumbnail) {
+                gtk_image_set_from_pixbuf(GTK_IMAGE(tooltip_image), thumbnail);
+                gtk_widget_show(tooltip_image);
+                g_object_unref(thumbnail);
+            } else {
+                // Clear and hide image if screenshot doesn't exist
+                gtk_image_clear(GTK_IMAGE(tooltip_image));
+                gtk_widget_hide(tooltip_image);
+            }
         } else {
+            // Clear and hide image if workspace is empty (prevents showing previous workspace's image)
+            gtk_image_clear(GTK_IMAGE(tooltip_image));
             gtk_widget_hide(tooltip_image);
         }
         
@@ -583,24 +637,97 @@ public:
         }
     }
 
+    bool is_currently_on_special_workspace() {
+        // Check active window's workspace - this is more reliable than activeworkspace
+        // because activeworkspace can return the workspace switcher window's workspace
+        std::string command = "hyprctl -j activewindow 2>/dev/null | jq -r '.workspace.id' 2>/dev/null";
+        FILE* pipe = popen(command.c_str(), "r");
+        if (!pipe) {
+            return false;
+        }
+        char buffer[128];
+        bool result = false;
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            std::string workspace_id_str = buffer;
+            // Remove trailing newline and whitespace
+            while (!workspace_id_str.empty() && (workspace_id_str.back() == '\n' || workspace_id_str.back() == '\r' || workspace_id_str.back() == ' ')) {
+                workspace_id_str.pop_back();
+            }
+            // Special workspaces have negative IDs
+            try {
+                int workspace_id = std::stoi(workspace_id_str);
+                result = (workspace_id < 0);
+            } catch (...) {
+                // If parsing fails, try checking workspace name as fallback
+                pclose(pipe);
+                std::string name_command = "hyprctl -j activewindow 2>/dev/null | jq -r '.workspace.name' 2>/dev/null";
+                FILE* name_pipe = popen(name_command.c_str(), "r");
+                if (name_pipe) {
+                    char name_buffer[128];
+                    if (fgets(name_buffer, sizeof(name_buffer), name_pipe) != nullptr) {
+                        std::string workspace_name = name_buffer;
+                        while (!workspace_name.empty() && (workspace_name.back() == '\n' || workspace_name.back() == '\r' || workspace_name.back() == ' ')) {
+                            workspace_name.pop_back();
+                        }
+                        result = (workspace_name == "special:elysia" || workspace_name.find("special:") == 0);
+                    }
+                    pclose(name_pipe);
+                }
+                return result;
+            }
+        }
+        pclose(pipe);
+        return result;
+    }
+
     void switch_workspace(int workspace_num) {
-        std::string command;
+        bool is_on_special = is_currently_on_special_workspace();
+        // Debug: Get active window workspace info (more accurate than activeworkspace)
+        std::string debug_cmd = "hyprctl -j activewindow 2>/dev/null | jq -r '\"Window WS ID: \" + (.workspace.id | tostring) + \", Name: \" + .workspace.name' 2>/dev/null";
+        FILE* debug_pipe = popen(debug_cmd.c_str(), "r");
+        if (debug_pipe) {
+            char debug_buffer[256];
+            if (fgets(debug_buffer, sizeof(debug_buffer), debug_pipe) != nullptr) {
+                std::string debug_info = debug_buffer;
+                while (!debug_info.empty() && (debug_info.back() == '\n' || debug_info.back() == '\r')) {
+                    debug_info.pop_back();
+                }
+                std::cerr << "DEBUG: Switching to workspace " << workspace_num << ", is_on_special=" << (is_on_special ? "true" : "false") << ", " << debug_info << std::endl;
+            }
+            pclose(debug_pipe);
+        }
+        
         if (workspace_num == 13) {
             // Special workspace toggle
-            command = "hyprctl dispatch togglespecialworkspace elysia &";
-        } else {
-            // Regular workspace switch
-            command = "hyprctl dispatch workspace " + std::to_string(workspace_num) + " &";
-        }
-        int result = system(command.c_str());
-        if (result == 0) {
-            if (workspace_num == 13) {
+            std::string command = "hyprctl dispatch togglespecialworkspace elysia &";
+            int result = system(command.c_str());
+            if (result == 0) {
                 std::cout << "Toggled special workspace elysia" << std::endl;
             } else {
-                std::cout << "Switched to workspace " << workspace_num << std::endl;
+                std::cerr << "Error toggling special workspace" << std::endl;
             }
         } else {
-            std::cerr << "Error switching to workspace " << workspace_num << std::endl;
+            // Regular workspace switch
+            if (is_on_special) {
+                // If currently on special workspace, toggle it off and switch to new workspace
+                // Use bash -c with && to ensure toggle completes before switching
+                std::string combined_cmd = "bash -c \"hyprctl dispatch togglespecialworkspace elysia && hyprctl dispatch workspace " + std::to_string(workspace_num) + "\" &";
+                int result = system(combined_cmd.c_str());
+                if (result == 0) {
+                    std::cout << "Toggled special workspace off and switched to workspace " << workspace_num << std::endl;
+                } else {
+                    std::cerr << "Error switching from special workspace to workspace " << workspace_num << std::endl;
+                }
+            } else {
+                // Normal workspace switch
+                std::string command = "hyprctl dispatch workspace " + std::to_string(workspace_num) + " &";
+                int result = system(command.c_str());
+                if (result == 0) {
+                    std::cout << "Switched to workspace " << workspace_num << std::endl;
+                } else {
+                    std::cerr << "Error switching to workspace " << workspace_num << std::endl;
+                }
+            }
         }
     }
 
